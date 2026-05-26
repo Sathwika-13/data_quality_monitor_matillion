@@ -1,0 +1,304 @@
+type: "orchestration"
+version: "1.0"
+pipeline:
+  metadata:
+    description: "Data Quality Monitoring Pipeline. Runs automated validation checks\
+      \       (null counts, duplicate detection, referential integrity, freshness)\
+      \ against       target tables. Logs results to an audit table and sends alert\
+      \ emails when       quality thresholds are breached. Demonstrates conditional\
+      \ branching, audit       logging, and reusable quality framework pattern."
+    origin: "maia-37752454-bfb9-4018-a158-74729f2229da"
+  components:
+    Start:
+      type: "start"
+      transitions:
+        unconditional:
+        - "Initialize Audit Run"
+      parameters:
+        componentName: "Start"
+    Initialize Audit Run:
+      type: "sql-executor"
+      transitions:
+        success:
+        - "Check Null Counts"
+        - "Check Duplicates"
+        - "Check Referential Integrity"
+        - "Check Data Freshness"
+      parameters:
+        componentName: "Initialize Audit Run"
+        scriptLocation: "Component"
+        enableVariableResolution: "Yes"
+        sqlScript: |
+          -- Create audit results table if not exists
+          CREATE TABLE IF NOT EXISTS "${v_target_database}"."${v_target_schema}"."DQ_AUDIT_RESULTS" (
+            "RUN_ID" STRING DEFAULT UUID_STRING(),
+            "CHECK_NAME" STRING,
+            "TABLE_NAME" STRING,
+            "COLUMN_NAME" STRING,
+            "CHECK_TYPE" STRING,
+            "RESULT_VALUE" NUMBER,
+            "THRESHOLD" NUMBER,
+            "STATUS" STRING,
+            "EXECUTED_AT" TIMESTAMP DEFAULT CURRENT_TIMESTAMP()
+          );
+          -- Clear previous run results
+          DELETE FROM "${v_target_database}"."${v_target_schema}"."DQ_AUDIT_RESULTS"
+          WHERE "EXECUTED_AT" < DATEADD(day, -30, CURRENT_TIMESTAMP());
+    Check Null Counts:
+      type: "sql-executor"
+      transitions:
+        unconditional:
+        - "Collect Results"
+      parameters:
+        componentName: "Check Null Counts"
+        scriptLocation: "Component"
+        enableVariableResolution: "Yes"
+        sqlScript: |
+          -- Check critical columns for unexpected NULLs
+          INSERT INTO "${v_target_database}"."${v_target_schema}"."DQ_AUDIT_RESULTS"
+            ("CHECK_NAME", "TABLE_NAME", "COLUMN_NAME", "CHECK_TYPE", "RESULT_VALUE", "THRESHOLD", "STATUS")
+          SELECT
+            'NULL_CHECK_ORDERS_CUSTOMER_ID',
+            'FACT_ORDERS',
+            'CUSTOMER_ID',
+            'NULL_COUNT',
+            COUNT(*) - COUNT("CUSTOMER_ID"),
+            0,
+            CASE WHEN COUNT(*) - COUNT("CUSTOMER_ID") > 0 THEN 'FAIL' ELSE 'PASS' END
+          FROM "${v_target_database}"."${v_target_schema}"."FACT_ORDERS";
+
+          INSERT INTO "${v_target_database}"."${v_target_schema}"."DQ_AUDIT_RESULTS"
+            ("CHECK_NAME", "TABLE_NAME", "COLUMN_NAME", "CHECK_TYPE", "RESULT_VALUE", "THRESHOLD", "STATUS")
+          SELECT
+            'NULL_CHECK_ORDERS_ORDER_DATE',
+            'FACT_ORDERS',
+            'ORDER_DATE',
+            'NULL_COUNT',
+            COUNT(*) - COUNT("ORDER_DATE"),
+            0,
+            CASE WHEN COUNT(*) - COUNT("ORDER_DATE") > 0 THEN 'FAIL' ELSE 'PASS' END
+          FROM "${v_target_database}"."${v_target_schema}"."FACT_ORDERS";
+    Check Duplicates:
+      type: "sql-executor"
+      transitions:
+        unconditional:
+        - "Collect Results"
+      parameters:
+        componentName: "Check Duplicates"
+        scriptLocation: "Component"
+        enableVariableResolution: "Yes"
+        sqlScript: |
+          -- Check for duplicate primary keys
+          INSERT INTO "${v_target_database}"."${v_target_schema}"."DQ_AUDIT_RESULTS"
+            ("CHECK_NAME", "TABLE_NAME", "COLUMN_NAME", "CHECK_TYPE", "RESULT_VALUE", "THRESHOLD", "STATUS")
+          SELECT
+            'DUPLICATE_CHECK_ORDERS_PK',
+            'FACT_ORDERS',
+            'ORDER_ID',
+            'DUPLICATE_COUNT',
+            COALESCE(SUM(CASE WHEN cnt > 1 THEN cnt - 1 ELSE 0 END), 0),
+            0,
+            CASE WHEN COALESCE(SUM(CASE WHEN cnt > 1 THEN cnt - 1 ELSE 0 END), 0) > 0 THEN 'FAIL' ELSE 'PASS' END
+          FROM (SELECT "ORDER_ID", COUNT(*) AS cnt FROM "${v_target_database}"."${v_target_schema}"."FACT_ORDERS" GROUP BY "ORDER_ID");
+
+          INSERT INTO "${v_target_database}"."${v_target_schema}"."DQ_AUDIT_RESULTS"
+            ("CHECK_NAME", "TABLE_NAME", "COLUMN_NAME", "CHECK_TYPE", "RESULT_VALUE", "THRESHOLD", "STATUS")
+          SELECT
+            'DUPLICATE_CHECK_CUSTOMERS_PK',
+            'DIM_CUSTOMERS',
+            'CUSTOMER_ID',
+            'DUPLICATE_COUNT',
+            COALESCE(SUM(CASE WHEN cnt > 1 THEN cnt - 1 ELSE 0 END), 0),
+            0,
+            CASE WHEN COALESCE(SUM(CASE WHEN cnt > 1 THEN cnt - 1 ELSE 0 END), 0) > 0 THEN 'FAIL' ELSE 'PASS' END
+          FROM (SELECT "CUSTOMER_ID", COUNT(*) AS cnt FROM "${v_target_database}"."${v_target_schema}"."DIM_CUSTOMERS" GROUP BY "CUSTOMER_ID");
+    Check Referential Integrity:
+      type: "sql-executor"
+      transitions:
+        unconditional:
+        - "Collect Results"
+      parameters:
+        componentName: "Check Referential Integrity"
+        scriptLocation: "Component"
+        enableVariableResolution: "Yes"
+        sqlScript: |
+          -- Check FK relationships (orphan records)
+          INSERT INTO "${v_target_database}"."${v_target_schema}"."DQ_AUDIT_RESULTS"
+            ("CHECK_NAME", "TABLE_NAME", "COLUMN_NAME", "CHECK_TYPE", "RESULT_VALUE", "THRESHOLD", "STATUS")
+          SELECT
+            'FK_CHECK_ORDERS_TO_CUSTOMERS',
+            'FACT_ORDERS',
+            'CUSTOMER_ID',
+            'ORPHAN_RECORDS',
+            COUNT(*),
+            0,
+            CASE WHEN COUNT(*) > 0 THEN 'FAIL' ELSE 'PASS' END
+          FROM "${v_target_database}"."${v_target_schema}"."FACT_ORDERS" o
+          LEFT JOIN "${v_target_database}"."${v_target_schema}"."DIM_CUSTOMERS" c
+            ON o."CUSTOMER_ID" = c."CUSTOMER_ID"
+          WHERE c."CUSTOMER_ID" IS NULL AND o."CUSTOMER_ID" IS NOT NULL;
+    Check Data Freshness:
+      type: "sql-executor"
+      transitions:
+        unconditional:
+        - "Collect Results"
+      parameters:
+        componentName: "Check Data Freshness"
+        scriptLocation: "Component"
+        enableVariableResolution: "Yes"
+        sqlScript: |
+          -- Check that data has been loaded within last 24 hours
+          INSERT INTO "${v_target_database}"."${v_target_schema}"."DQ_AUDIT_RESULTS"
+            ("CHECK_NAME", "TABLE_NAME", "COLUMN_NAME", "CHECK_TYPE", "RESULT_VALUE", "THRESHOLD", "STATUS")
+          SELECT
+            'FRESHNESS_CHECK_ORDERS',
+            'FACT_ORDERS',
+            'LOADED_AT',
+            'HOURS_SINCE_LAST_LOAD',
+            DATEDIFF(hour, MAX("LOADED_AT"), CURRENT_TIMESTAMP()),
+            24,
+            CASE WHEN DATEDIFF(hour, MAX("LOADED_AT"), CURRENT_TIMESTAMP()) > 24 THEN 'FAIL' ELSE 'PASS' END
+          FROM "${v_target_database}"."${v_target_schema}"."FACT_ORDERS";
+    Collect Results:
+      type: "and"
+      transitions:
+        unconditional:
+        - "Evaluate Quality Gate"
+      parameters:
+        componentName: "Collect Results"
+    Evaluate Quality Gate:
+      type: "sql-executor"
+      transitions:
+        success:
+        - "Log Pass"
+        failure:
+        - "Send Quality Alert"
+      parameters:
+        componentName: "Evaluate Quality Gate"
+        scriptLocation: "Component"
+        enableVariableResolution: "Yes"
+        sqlScript: |
+          -- Fail if any checks breached threshold
+          -- Division by zero pattern: errors if failed checks > threshold
+          SET v_check = (
+            SELECT CASE
+              WHEN COUNT(*) > ${v_failure_threshold} THEN 1/0
+              ELSE 1
+            END
+            FROM "${v_target_database}"."${v_target_schema}"."DQ_AUDIT_RESULTS"
+            WHERE "STATUS" = 'FAIL'
+              AND "EXECUTED_AT" >= DATEADD(minute, -10, CURRENT_TIMESTAMP())
+          );
+    Log Pass:
+      type: "sql-executor"
+      parameters:
+        componentName: "Log Pass"
+        scriptLocation: "Component"
+        enableVariableResolution: "Yes"
+        sqlScript: |
+          INSERT INTO "${v_target_database}"."${v_target_schema}"."DQ_AUDIT_RESULTS"
+            ("CHECK_NAME", "TABLE_NAME", "CHECK_TYPE", "RESULT_VALUE", "STATUS")
+          SELECT 'OVERALL_QUALITY_GATE', 'ALL_TABLES', 'GATE_STATUS', 0, 'PASS';
+    Send Quality Alert:
+      type: "send-email-v2"
+      parameters:
+        componentName: "Send Quality Alert"
+        toRecipients:
+        - "${v_email_recipients}"
+        subject: "DATA QUALITY ALERT - Checks Failed"
+        message: |-
+          Data Quality Monitor detected failures.
+
+          One or more quality checks have breached their threshold.
+          Database: ${v_target_database}
+          Schema: ${v_target_schema}
+
+          Failed checks have been logged to DQ_AUDIT_RESULTS table.
+          Please review and take corrective action.
+
+          Check types run:
+          - Null Count Validation
+          - Duplicate Detection
+          - Referential Integrity
+          - Data Freshness
+        senderAddress: "noreply@company.com"
+        smtpUsername: "noreply@company.com"
+        smtpPassword: "smtp-secret"
+        smtpHostname: "${v_smtp_hostname}"
+        smtpPort: "25"
+        enableSslTls: "No"
+        enableStartTls: "No"
+  variables:
+    v_target_database:
+      metadata:
+        type: "TEXT"
+        description: "Database containing tables to validate"
+        scope: "COPIED"
+        visibility: "PRIVATE"
+      defaultValue: "ANALYTICS_DB"
+    v_target_schema:
+      metadata:
+        type: "TEXT"
+        description: "Schema containing tables to validate"
+        scope: "COPIED"
+        visibility: "PRIVATE"
+      defaultValue: "PUBLIC"
+    v_failure_threshold:
+      metadata:
+        type: "NUMBER"
+        description: "Number of failed checks before alert triggers"
+        scope: "COPIED"
+        visibility: "PRIVATE"
+      defaultValue: "0"
+design:
+  components:
+    Start:
+      position:
+        x: 0
+        "y": 0
+      tempMetlId:
+    Initialize Audit Run:
+      position:
+        x: 200
+        "y": 0
+      tempMetlId:
+    Check Null Counts:
+      position:
+        x: 450
+        "y": -150
+      tempMetlId:
+    Check Duplicates:
+      position:
+        x: 450
+        "y": -50
+      tempMetlId:
+    Check Referential Integrity:
+      position:
+        x: 450
+        "y": 50
+      tempMetlId:
+    Check Data Freshness:
+      position:
+        x: 450
+        "y": 150
+      tempMetlId:
+    Collect Results:
+      position:
+        x: 700
+        "y": 0
+      tempMetlId:
+    Evaluate Quality Gate:
+      position:
+        x: 900
+        "y": 0
+      tempMetlId:
+    Log Pass:
+      position:
+        x: 1100
+        "y": -60
+      tempMetlId:
+    Send Quality Alert:
+      position:
+        x: 1100
+        "y": 60
+      tempMetlId:
